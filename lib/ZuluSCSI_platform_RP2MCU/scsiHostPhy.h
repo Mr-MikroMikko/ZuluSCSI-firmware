@@ -36,7 +36,10 @@ void scsiHostPhyReset(void);
 // Select a device, id 0-7.
 // target_id - target device id 0-7
 // initiator_id - host device id 0-7
+// Pass SCSI_HOST_SELECT_NO_INITIATOR_ID as initiator_id to assert only the
+// target ID bit (SASI controllers such as Xebec S1410).
 // Returns true if the target answers to selection request.
+#define SCSI_HOST_SELECT_NO_INITIATOR_ID 0xFF
 bool scsiHostPhySelect(int target_id, uint8_t initiator_id);
 
 // Set SCSI ATN signal to request MESSAGE_OUT phase

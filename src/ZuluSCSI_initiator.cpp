@@ -87,6 +87,20 @@ static struct {
     bool use_read10; // Always use read10 commands
     bool use_identify; // Select with ATN and send IDENTIFY before each command
 
+    // SASI mode (InitiatorSASI=1): Xebec S1410 / WD1002-type controllers.
+    // No messages, no INQUIRY / READ CAPACITY / START STOP UNIT, 4 byte sense,
+    // geometry comes from the .ini file.
+    bool sasi;
+    bool sasi_send_params;          // Send Initialize Drive Characteristics (0x0C)
+    bool sasi_select_initiator_bit; // Assert initiator ID bit during selection
+    uint32_t sasi_cylinders;
+    uint32_t sasi_heads;
+    uint32_t sasi_sectors_per_track;
+    uint32_t sasi_blocksize;
+    uint32_t sasi_reduced_write;
+    uint32_t sasi_precomp;
+    uint32_t sasi_ecc_burst;
+
     // Is imaging a drive in progress, or are we scanning?
     bool imaging;
 
@@ -142,6 +156,26 @@ void scsiInitiatorInit()
     g_initiator_state.use_read10 = ini_getbool("SCSI", "InitiatorUseRead10", false, CONFIGFILE);
     g_initiator_state.use_identify = ini_getbool("SCSI", "InitiatorIdentify", true, CONFIGFILE);
     g_initiator_state.use_vhd_format = ini_getbool("SCSI", "InitiatorVHD", false, CONFIGFILE);
+
+    g_initiator_state.sasi = ini_getbool("SCSI", "InitiatorSASI", false, CONFIGFILE);
+    if (g_initiator_state.sasi)
+    {
+        g_initiator_state.use_identify = false; // SASI has no message phases
+        g_initiator_state.use_vhd_format = false;
+        g_initiator_state.sasi_send_params = ini_getbool("SCSI", "InitiatorSASIInitParams", true, CONFIGFILE);
+        g_initiator_state.sasi_select_initiator_bit = ini_getbool("SCSI", "InitiatorSASISelectInitiatorBit", false, CONFIGFILE);
+        g_initiator_state.sasi_cylinders = ini_getl("SCSI", "InitiatorSASICylinders", 306, CONFIGFILE);
+        g_initiator_state.sasi_heads = ini_getl("SCSI", "InitiatorSASIHeads", 2, CONFIGFILE);
+        g_initiator_state.sasi_sectors_per_track = ini_getl("SCSI", "InitiatorSASISectorsPerTrack", 32, CONFIGFILE);
+        g_initiator_state.sasi_blocksize = ini_getl("SCSI", "InitiatorSASIBlockSize", 256, CONFIGFILE);
+        g_initiator_state.sasi_reduced_write = ini_getl("SCSI", "InitiatorSASIReducedWriteCyl", g_initiator_state.sasi_cylinders, CONFIGFILE);
+        g_initiator_state.sasi_precomp = ini_getl("SCSI", "InitiatorSASIPrecompCyl", g_initiator_state.sasi_cylinders, CONFIGFILE);
+        g_initiator_state.sasi_ecc_burst = ini_getl("SCSI", "InitiatorSASIEccBurst", 11, CONFIGFILE);
+        logmsg("SASI initiator mode: ", (int)g_initiator_state.sasi_cylinders, " cyl x ",
+               (int)g_initiator_state.sasi_heads, " heads x ",
+               (int)g_initiator_state.sasi_sectors_per_track, " sectors x ",
+               (int)g_initiator_state.sasi_blocksize, " bytes");
+    }
 
     // treat initiator id as already imaged drive so it gets skipped
     g_initiator_state.drives_imaged = 1 << g_initiator_state.initiator_id;
@@ -336,12 +370,15 @@ void scsiInitiatorMainLoop()
 
             LED_ON();
 
-            bool startstopok =
-                scsiTestUnitReady(g_initiator_state.target_id) &&
-                scsiStartStopUnit(g_initiator_state.target_id, true);
+            // SASI controllers do not implement START STOP UNIT, use the
+            // SASI specific probe sequence instead.
+            bool startstopok = g_initiator_state.sasi ?
+                scsiSasiProbe(g_initiator_state.target_id) :
+                (scsiTestUnitReady(g_initiator_state.target_id) &&
+                 scsiStartStopUnit(g_initiator_state.target_id, true));
 
 #if defined(PLATFORM_MAX_BUS_WIDTH) && PLATFORM_MAX_BUS_WIDTH > 0
-            if (startstopok)
+            if (startstopok && !g_initiator_state.sasi)
             {
                 // Negotiate bus width
                 // This is done before other commands just in case the target
@@ -358,13 +395,39 @@ void scsiInitiatorMainLoop()
             }
 #endif
 
-            bool readcapok = startstopok &&
-                scsiInitiatorReadCapacity(g_initiator_state.target_id,
-                                          &g_initiator_state.sectorcount,
-                                          &g_initiator_state.sectorsize);
+            bool readcapok;
+            bool inquiryok;
+            if (g_initiator_state.sasi)
+            {
+                // SASI has no READ CAPACITY or INQUIRY, geometry is from .ini
+                readcapok = startstopok;
+                inquiryok = false;
+                if (readcapok)
+                {
+                    g_initiator_state.sectorsize = g_initiator_state.sasi_blocksize;
+                    g_initiator_state.sectorcount = g_initiator_state.sasi_cylinders
+                        * g_initiator_state.sasi_heads * g_initiator_state.sasi_sectors_per_track;
+                    g_initiator_state.use_read10 = false;
+                    // Keep transfers well below the 256 block limit of READ6
+                    g_initiator_state.max_sector_per_transfer = 64;
+                    uint32_t max_by_buffer = sizeof(scsiDev.data) / g_initiator_state.sectorsize;
+                    if (max_by_buffer < g_initiator_state.max_sector_per_transfer)
+                    {
+                        g_initiator_state.max_sector_per_transfer = max_by_buffer;
+                    }
+                    logmsg("SASI target ", g_initiator_state.target_id, " assumed geometry, vendor/product unknown");
+                }
+            }
+            else
+            {
+                readcapok = startstopok &&
+                    scsiInitiatorReadCapacity(g_initiator_state.target_id,
+                                              &g_initiator_state.sectorcount,
+                                              &g_initiator_state.sectorsize);
 
-            bool inquiryok = startstopok &&
-                scsiInquiry(g_initiator_state.target_id, inquiry_data);
+                inquiryok = startstopok &&
+                    scsiInquiry(g_initiator_state.target_id, inquiry_data);
+            }
 
             LED_OFF();
 
@@ -632,7 +695,10 @@ void scsiInitiatorMainLoop()
         // Copy sectors from SCSI drive to file
         if (g_initiator_state.sectors_done >= g_initiator_state.sectorcount)
         {
-            scsiStartStopUnit(g_initiator_state.target_id, false);
+            if (!g_initiator_state.sasi)
+            {
+                scsiStartStopUnit(g_initiator_state.target_id, false);
+            }
             logmsg("Finished imaging drive with id ", g_initiator_state.target_id);
             LED_OFF();
 
@@ -775,7 +841,11 @@ int scsiInitiatorRunCommand(int target_id,
         scsiHostPhySetATN(true);
     }
 
-    if (!scsiHostPhySelect(target_id, g_initiator_state.initiator_id))
+    // SASI hosts typically assert only the target ID bit during selection
+    uint8_t select_initiator_id = (g_initiator_state.sasi && !g_initiator_state.sasi_select_initiator_bit) ?
+        SCSI_HOST_SELECT_NO_INITIATOR_ID : g_initiator_state.initiator_id;
+
+    if (!scsiHostPhySelect(target_id, select_initiator_id))
     {
         scsiHostPhySetATN(false);
         dbgmsg("------ Target ", target_id, " did not respond");
@@ -1029,6 +1099,28 @@ bool scsiInitiatorReadCapacity(int target_id, uint32_t *sectorcount, uint32_t *s
 // Execute REQUEST SENSE command to get more information about error status
 bool scsiRequestSense(int target_id, uint8_t *sense_key, uint8_t *sense_asc, uint8_t *sense_ascq)
 {
+    if (g_initiator_state.sasi)
+    {
+        // SASI (Xebec S1410) returns exactly 4 bytes and has no allocation length:
+        //   byte 0: bit 7 address valid, bits 5-4 error type, bits 3-0 error code
+        //   bytes 1-3: drive select bit + logical block address
+        uint8_t sasi_command[6] = {0x03, 0, 0, 0, 0, 0};
+        uint8_t sasi_response[4] = {0};
+        int sasi_status = scsiInitiatorRunCommand(target_id,
+                                                  sasi_command, sizeof(sasi_command),
+                                                  sasi_response, sizeof(sasi_response),
+                                                  NULL, 0);
+        uint8_t error = sasi_response[0] & 0x7F;
+        dbgmsg("SASI RequestSense response: ", bytearray(sasi_response, 4),
+               " error type ", (int)((error >> 4) & 3), " code ", (int)(error & 0xF));
+
+        // Map to the closest SCSI sense key for the callers
+        if (sense_key) *sense_key = (error == 0) ? NO_SENSE : MEDIUM_ERROR;
+        if (sense_asc) *sense_asc = error;
+        if (sense_ascq) *sense_ascq = 0;
+        return sasi_status == 0;
+    }
+
     uint8_t command[6] = {0x03, 0, 0, 0, 18, 0};
     uint8_t response[18] = {0};
 
@@ -1046,6 +1138,62 @@ bool scsiRequestSense(int target_id, uint8_t *sense_key, uint8_t *sense_asc, uin
     if (sense_ascq) *sense_ascq = response[13];
 
     return status == 0;
+}
+
+// SASI (Xebec S1410, WD1002) drive bring-up:
+// TEST DRIVE READY, optionally INITIALIZE DRIVE CHARACTERISTICS (0x0C) with
+// the geometry from the .ini file, then RECALIBRATE.
+bool scsiSasiProbe(int target_id)
+{
+    uint8_t tur[6] = {0x00, 0, 0, 0, 0, 0};
+    int status = scsiInitiatorRunCommand(target_id, tur, sizeof(tur), NULL, 0, NULL, 0);
+    if (status == -1)
+    {
+        // No response to selection
+        return false;
+    }
+    else if (status != 0)
+    {
+        uint8_t sense_key;
+        uint8_t error;
+        scsiRequestSense(target_id, &sense_key, &error);
+        dbgmsg("SASI TEST DRIVE READY failed, status ", status, " error ", (int)error);
+        // Continue anyway: the controller often reports an error until initialized
+    }
+
+    if (g_initiator_state.sasi_send_params)
+    {
+        uint8_t cmd[6] = {0x0C, 0, 0, 0, 0, 0};
+        uint8_t params[8] = {
+            (uint8_t)(g_initiator_state.sasi_cylinders >> 8), (uint8_t)g_initiator_state.sasi_cylinders,
+            (uint8_t)g_initiator_state.sasi_heads,
+            (uint8_t)(g_initiator_state.sasi_reduced_write >> 8), (uint8_t)g_initiator_state.sasi_reduced_write,
+            (uint8_t)(g_initiator_state.sasi_precomp >> 8), (uint8_t)g_initiator_state.sasi_precomp,
+            (uint8_t)g_initiator_state.sasi_ecc_burst
+        };
+        status = scsiInitiatorRunCommand(target_id, cmd, sizeof(cmd), NULL, 0, params, sizeof(params));
+        if (status != 0)
+        {
+            uint8_t sense_key;
+            uint8_t error;
+            scsiRequestSense(target_id, &sense_key, &error);
+            logmsg("SASI Initialize Drive Characteristics failed, status ", status, " error ", (int)error);
+            return false;
+        }
+    }
+
+    uint8_t recal[6] = {0x01, 0, 0, 0, 0, 0};
+    status = scsiInitiatorRunCommand(target_id, recal, sizeof(recal), NULL, 0, NULL, 0, false, 60000);
+    if (status != 0)
+    {
+        uint8_t sense_key;
+        uint8_t error;
+        scsiRequestSense(target_id, &sense_key, &error);
+        logmsg("SASI Recalibrate failed, status ", status, " error ", (int)error);
+        return false;
+    }
+
+    return true;
 }
 
 // Execute UNIT START STOP command to load/unload media

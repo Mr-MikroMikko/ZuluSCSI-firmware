@@ -76,6 +76,9 @@ bool scsiInitiatorReadCapacity(int target_id, uint32_t *sectorcount, uint32_t *s
 // Execute REQUEST SENSE command to get more information about error status
 bool scsiRequestSense(int target_id, uint8_t *sense_key, uint8_t *sense_asc = nullptr, uint8_t *sense_ascq = nullptr);
 
+// SASI (Xebec S1410 / WD1002) drive bring-up, used when InitiatorSASI=1
+bool scsiSasiProbe(int target_id);
+
 // Execute UNIT START STOP command to load/unload media
 bool scsiStartStopUnit(int target_id, bool start);
 

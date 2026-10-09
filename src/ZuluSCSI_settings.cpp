@@ -894,7 +894,9 @@ scsi_system_settings_t *ZuluSCSISettings::initSystem(const char *presetName, boo
     
     cfgSys.wifi_keep_alive_s = log_ini_getl("SCSI", "WiFiKeepAliveSecs", cfgSys.wifi_keep_alive_s, CONFIGFILE, log_settings);
 
-    cfgSys.initiatorParity = log_ini_getbool("SCSI", "InitiatorParity", cfgSys.initiatorParity, CONFIGFILE, log_settings);
+    // SASI controllers (Xebec S1410) do not generate parity: default to off in SASI initiator mode
+    bool initiatorSasi = ini_getbool("SCSI", "InitiatorSASI", false, CONFIGFILE);
+    cfgSys.initiatorParity = log_ini_getbool("SCSI", "InitiatorParity", initiatorSasi ? false : cfgSys.initiatorParity, CONFIGFILE, log_settings);
 
     cfgSys.dumpCachedSettings = log_ini_getbool("SCSI", "DumpCachedSettings", cfgSys.dumpCachedSettings, CONFIGFILE, log_settings);
 
