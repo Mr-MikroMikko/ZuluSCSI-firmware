@@ -42,6 +42,10 @@ void scsiHostPhyReset(void);
 #define SCSI_HOST_SELECT_NO_INITIATOR_ID 0xFF
 bool scsiHostPhySelect(int target_id, uint8_t initiator_id);
 
+// Diagnostic snapshot of bus lines. Returns bit mask: 1 BSY, 2 REQ, 4 C/D, 8 I/O, 16 MSG
+// (set = asserted). The data bus (set = asserted) is stored to *data if not NULL.
+uint32_t scsiHostPhyGetRawState(uint32_t *data);
+
 // Set SCSI ATN signal to request MESSAGE_OUT phase
 void scsiHostPhySetATN(bool atn);
 

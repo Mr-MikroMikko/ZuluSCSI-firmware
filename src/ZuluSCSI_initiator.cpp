@@ -826,6 +826,22 @@ void scsiInitiatorMainLoop()
  * Low level command implementations *
  *************************************/
 
+// Debug log of the raw bus line states (BSY REQ C/D I/O MSG and data bus, 1 = asserted)
+static void logRawBusState(const char *tag)
+{
+    uint32_t data = 0;
+    uint32_t s = scsiHostPhyGetRawState(&data);
+    char db[16];
+    for (int i = 0; i < 9; i++)
+    {
+        db[i] = (data & (1 << (8 - i))) ? '1' : '0';
+    }
+    db[9] = 0;
+    dbgmsg("------ ", tag, ": BSY=", (int)(s & 1), " REQ=", (int)((s >> 1) & 1),
+           " CD=", (int)((s >> 2) & 1), " IO=", (int)((s >> 3) & 1),
+           " MSG=", (int)((s >> 4) & 1), " DB8..DB0=", db);
+}
+
 int scsiInitiatorRunCommand(int target_id,
                             const uint8_t *command, size_t cmdLen,
                             uint8_t *bufIn, size_t bufInLen,
@@ -858,6 +874,17 @@ int scsiInitiatorRunCommand(int target_id,
     SCSI_PHASE phase;
     int status = -1;
     uint32_t start = millis();
+
+    if (g_initiator_state.sasi)
+    {
+        // Diagnostics: how does the bus look right after the target answered selection?
+        logRawBusState("SASI bus after selection");
+        delayMicroseconds(100);
+        logRawBusState("SASI bus after selection +100us");
+    }
+    uint32_t unknown_phase_since = 0;
+    int last_unknown_phase = -100;
+
     while ((phase = (SCSI_PHASE)scsiHostPhyGetPhase()) != BUS_FREE)
     {
         // If explicit timeout is specified, prevent watchdog from triggering too early.
@@ -867,6 +894,29 @@ int scsiInitiatorRunCommand(int target_id,
         }
 
         platform_poll();
+
+        // A phase that is not a legal SCSI phase (e.g. MSG alone) is never handled below.
+        // Log it with the raw line states and give up instead of spinning until the watchdog fires.
+        if (phase != BUS_BUSY && phase != MESSAGE_IN && phase != MESSAGE_OUT && phase != COMMAND &&
+            phase != DATA_IN && phase != DATA_OUT && phase != STATUS)
+        {
+            if (phase != last_unknown_phase)
+            {
+                last_unknown_phase = phase;
+                unknown_phase_since = millis();
+                logmsg("------ Illegal bus phase ", (int)phase, " from target ", target_id);
+                logRawBusState("Illegal phase, bus");
+            }
+            else if ((uint32_t)(millis() - unknown_phase_since) > 2000)
+            {
+                logmsg("------ Bus stuck in illegal phase ", (int)phase, " for 2 s, giving up");
+                logRawBusState("Stuck bus");
+                status = -4;
+                break;
+            }
+            continue;
+        }
+        last_unknown_phase = -100;
 
         if (phase == MESSAGE_IN)
         {

@@ -200,6 +200,20 @@ int scsiHostPhyGetPhase()
     }
 }
 
+// Diagnostic snapshot of the control lines and data bus, bit set = signal asserted.
+// Returned bits: 0 BSY, 1 REQ, 2 C/D, 3 I/O, 4 MSG. Data bus bits are returned in *data.
+uint32_t scsiHostPhyGetRawState(uint32_t *data)
+{
+    uint32_t state = 0;
+    if (SCSI_IN(BSY)) state |= 1;
+    if (SCSI_IN(REQ)) state |= 2;
+    if (SCSI_IN(CD))  state |= 4;
+    if (SCSI_IN(IO))  state |= 8;
+    if (SCSI_IN(MSG)) state |= 16;
+    if (data) *data = SCSI_IN_DATA();
+    return state;
+}
+
 bool scsiHostRequestWaiting()
 {
     return SCSI_IN(REQ);
