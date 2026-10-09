@@ -42,6 +42,12 @@ void scsiHostPhyReset(void);
 #define SCSI_HOST_SELECT_NO_INITIATOR_ID 0xFF
 bool scsiHostPhySelect(int target_id, uint8_t initiator_id);
 
+// Experiment: interpret the C/D and MSG inputs swapped (set from InitiatorSASISwapCdMsg)
+extern bool g_scsiHostSwapCdMsg;
+
+// Experiment: byte writes use a handshake with timeouts and bus state logging
+extern bool g_scsiHostDiag;
+
 // Diagnostic snapshot of bus lines. Returns bit mask: 1 BSY, 2 REQ, 4 C/D, 8 I/O, 16 MSG
 // (set = asserted). The data bus (set = asserted) is stored to *data if not NULL.
 uint32_t scsiHostPhyGetRawState(uint32_t *data);

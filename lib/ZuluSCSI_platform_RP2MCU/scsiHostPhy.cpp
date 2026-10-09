@@ -148,6 +148,12 @@ void scsiHostSetBusWidth(int busWidth)
 #endif
 }
 
+// When true, the C/D and MSG inputs are interpreted swapped (InitiatorSASISwapCdMsg=1)
+bool g_scsiHostSwapCdMsg = false;
+
+// When true, byte writes use a handshake with timeouts and bus state logging (SASI debugging)
+bool g_scsiHostDiag = false;
+
 // Read the current communication phase as signaled by the target
 int scsiHostPhyGetPhase()
 {
@@ -162,9 +168,18 @@ int scsiHostPhyGetPhase()
 
     int phase = 0;
     bool req_in = SCSI_IN(REQ);
-    if (SCSI_IN(CD)) phase |= __scsiphase_cd;
+    bool cd_in = SCSI_IN(CD);
+    bool msg_in = SCSI_IN(MSG);
+    if (g_scsiHostSwapCdMsg)
+    {
+        // Experiment for boards/targets where the C/D and MSG lines read swapped
+        bool tmp = cd_in;
+        cd_in = msg_in;
+        msg_in = tmp;
+    }
+    if (cd_in) phase |= __scsiphase_cd;
     if (SCSI_IN(IO)) phase |= __scsiphase_io;
-    if (SCSI_IN(MSG)) phase |= __scsiphase_msg;
+    if (msg_in) phase |= __scsiphase_msg;
 
     if (phase == 0 && absolute_time_diff_us(last_online_time, get_absolute_time()) > 100)
     {
@@ -300,6 +315,45 @@ static inline uint16_t scsiHostReadOneWord(int* parityError)
 }
 #endif
 
+// Wait for REQ to reach the wanted state. Returns false on timeout or bus reset.
+static bool scsiHostWaitReq(bool wantActive, uint32_t timeout_ms)
+{
+    uint32_t t0 = millis();
+    while ((bool)SCSI_IN(REQ) != wantActive)
+    {
+        if (g_scsiHostPhyReset || (uint32_t)(millis() - t0) > timeout_ms) return false;
+    }
+    return true;
+}
+
+// Diagnostic variant of the byte write handshake with timeouts and bus state logging.
+// Returns false if the target stalls.
+static bool scsiHostWriteOneByteDiag(uint8_t value, uint32_t index)
+{
+    if (!scsiHostWaitReq(true, 500))
+    {
+        logmsg("scsiHostWrite diag: stall waiting REQ for byte ", (int)index);
+        uint32_t d; uint32_t s = scsiHostPhyGetRawState(&d);
+        logmsg("  bus state mask ", (int)s, " (1 BSY, 2 REQ, 4 CD, 8 IO, 16 MSG) data ", (int)d);
+        return false;
+    }
+    SCSI_OUT_DATA(value);
+    delay_100ns();
+    SCSI_OUT(ACK, 1);
+    if (!scsiHostWaitReq(false, 500))
+    {
+        logmsg("scsiHostWrite diag: REQ stays active after ACK for byte ", (int)index, " value ", (int)value);
+        uint32_t d; uint32_t s = scsiHostPhyGetRawState(&d);
+        logmsg("  bus state mask ", (int)s, " (1 BSY, 2 REQ, 4 CD, 8 IO, 16 MSG) data ", (int)d);
+        SCSI_RELEASE_DATA_REQ();
+        SCSI_OUT(ACK, 0);
+        return false;
+    }
+    SCSI_RELEASE_DATA_REQ();
+    SCSI_OUT(ACK, 0);
+    return true;
+}
+
 uint32_t scsiHostWrite(const uint8_t *data, uint32_t count)
 {
     scsiLogDataOut(data, count);
@@ -319,7 +373,14 @@ uint32_t scsiHostWrite(const uint8_t *data, uint32_t count)
             }
         }
 
-        if (g_scsiHostBusWidth == 0)
+        if (g_scsiHostDiag && g_scsiHostBusWidth == 0)
+        {
+            if (!scsiHostWriteOneByteDiag(data[i], i))
+            {
+                return i;
+            }
+        }
+        else if (g_scsiHostBusWidth == 0)
         {
             scsiHostWriteOneByte(data[i]);
         }

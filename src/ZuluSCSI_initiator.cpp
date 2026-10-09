@@ -173,6 +173,12 @@ void scsiInitiatorInit()
         g_initiator_state.sasi_reduced_write = ini_getl("SCSI", "InitiatorSASIReducedWriteCyl", 128, CONFIGFILE);
         g_initiator_state.sasi_precomp = ini_getl("SCSI", "InitiatorSASIPrecompCyl", 64, CONFIGFILE);
         g_initiator_state.sasi_ecc_burst = ini_getl("SCSI", "InitiatorSASIEccBurst", 11, CONFIGFILE);
+        g_scsiHostDiag = true; // timeouts and bus state logging in byte writes
+        g_scsiHostSwapCdMsg = ini_getbool("SCSI", "InitiatorSASISwapCdMsg", false, CONFIGFILE);
+        if (g_scsiHostSwapCdMsg)
+        {
+            logmsg("SASI initiator: C/D and MSG inputs are interpreted swapped (InitiatorSASISwapCdMsg=1)");
+        }
         logmsg("SASI initiator mode: ", (int)g_initiator_state.sasi_cylinders, " cyl x ",
                (int)g_initiator_state.sasi_heads, " heads x ",
                (int)g_initiator_state.sasi_sectors_per_track, " sectors x ",
