@@ -517,6 +517,11 @@ void platform_init()
     dbglog = !gpio_get(DIP_DBGLOG);
     g_log_debug = dbglog;
 # endif
+
+# ifdef ZULUSCSI_FORCE_INITIATOR
+    // Test build for boards without an initiator switch (e.g. Compact RP2040 Rev 2022a)
+    g_scsi_initiator = true;
+# endif
 #else
     delay(10);
 #endif // HAS_DIP_SWITCHES
@@ -635,6 +640,9 @@ void platform_late_init()
         logmsg("*************************************************************************");
         logmsg("     SCSI initiator mode enabled, expecting SCSI disks on the bus        ");
         logmsg("*************************************************************************");
+#ifdef ZULUSCSI_FORCE_INITIATOR
+        logmsg("NOTE: initiator mode is forced by build option ZULUSCSI_FORCE_INITIATOR");
+#endif
         g_led_pwm.level_off = PLATFORM_LED_PWM_WRAP / PLATFORM_LED_PWM_INITIATOR_DIV;
     }
     else
