@@ -168,8 +168,10 @@ void scsiInitiatorInit()
         g_initiator_state.sasi_heads = ini_getl("SCSI", "InitiatorSASIHeads", 2, CONFIGFILE);
         g_initiator_state.sasi_sectors_per_track = ini_getl("SCSI", "InitiatorSASISectorsPerTrack", 32, CONFIGFILE);
         g_initiator_state.sasi_blocksize = ini_getl("SCSI", "InitiatorSASIBlockSize", 256, CONFIGFILE);
-        g_initiator_state.sasi_reduced_write = ini_getl("SCSI", "InitiatorSASIReducedWriteCyl", g_initiator_state.sasi_cylinders, CONFIGFILE);
-        g_initiator_state.sasi_precomp = ini_getl("SCSI", "InitiatorSASIPrecompCyl", g_initiator_state.sasi_cylinders, CONFIGFILE);
+        // Defaults are the Seagate ST-412 entry of the S1410 manual (appendix A), zero relative.
+        // They only affect writing, which the initiator never does.
+        g_initiator_state.sasi_reduced_write = ini_getl("SCSI", "InitiatorSASIReducedWriteCyl", 128, CONFIGFILE);
+        g_initiator_state.sasi_precomp = ini_getl("SCSI", "InitiatorSASIPrecompCyl", 64, CONFIGFILE);
         g_initiator_state.sasi_ecc_burst = ini_getl("SCSI", "InitiatorSASIEccBurst", 11, CONFIGFILE);
         logmsg("SASI initiator mode: ", (int)g_initiator_state.sasi_cylinders, " cyl x ",
                (int)g_initiator_state.sasi_heads, " heads x ",
@@ -1145,20 +1147,34 @@ bool scsiRequestSense(int target_id, uint8_t *sense_key, uint8_t *sense_asc, uin
 // the geometry from the .ini file, then RECALIBRATE.
 bool scsiSasiProbe(int target_id)
 {
+    // S1410 manual 4.7: issue Test Drive Ready repeatedly (with a time-out)
+    // until the drive reports ready, e.g. after spin-up.
     uint8_t tur[6] = {0x00, 0, 0, 0, 0, 0};
-    int status = scsiInitiatorRunCommand(target_id, tur, sizeof(tur), NULL, 0, NULL, 0);
-    if (status == -1)
+    int status = -1;
+    for (int tries = 0; tries < 30; tries++)
     {
-        // No response to selection
-        return false;
-    }
-    else if (status != 0)
-    {
+        status = scsiInitiatorRunCommand(target_id, tur, sizeof(tur), NULL, 0, NULL, 0);
+        if (status == -1)
+        {
+            // No response to selection
+            return false;
+        }
+        else if (status == 0)
+        {
+            break;
+        }
+
         uint8_t sense_key;
         uint8_t error;
         scsiRequestSense(target_id, &sense_key, &error);
         dbgmsg("SASI TEST DRIVE READY failed, status ", status, " error ", (int)error);
-        // Continue anyway: the controller often reports an error until initialized
+        delay_with_poll(1000);
+    }
+
+    if (status != 0)
+    {
+        logmsg("SASI drive on target ", target_id, " did not become ready");
+        return false;
     }
 
     if (g_initiator_state.sasi_send_params)
