@@ -100,6 +100,7 @@ static struct {
     uint32_t sasi_reduced_write;
     uint32_t sasi_precomp;
     uint32_t sasi_ecc_burst;
+    uint8_t sasi_last_error;        // Error code (hex) from the last REQUEST SENSE
 
     // Is imaging a drive in progress, or are we scanning?
     bool imaging;
@@ -780,9 +781,22 @@ void scsiInitiatorMainLoop()
 
             UIInitiatorFailedToTransfer(g_initiator_state.target_id);          
 
-            if (g_initiator_state.retrycount < g_initiator_state.max_retry_count)
+            // SASI: when a single sector fails with a media error (ID field read error,
+            // uncorrectable data, address mark / sector not found, bad track) retrying
+            // rarely helps: allow just one more attempt before skipping it.
+            uint32_t max_retry = g_initiator_state.max_retry_count;
+            if (g_initiator_state.sasi && numtoread == 1)
             {
-                logmsg("Retrying.. ", g_initiator_state.retrycount + 1, "/", (int) g_initiator_state.max_retry_count);
+                uint8_t e = g_initiator_state.sasi_last_error;
+                if ((e >= 0x10 && e <= 0x14) || e == 0x19)
+                {
+                    if (max_retry > 1) max_retry = 1;
+                }
+            }
+
+            if (g_initiator_state.retrycount < max_retry)
+            {
+                logmsg("Retrying.. ", g_initiator_state.retrycount + 1, "/", (int) max_retry);
                 delay_with_poll(200);
                 // This reset causes some drives to hang and seems to have no effect if left off.
                 // scsiHostPhyReset();
@@ -1177,8 +1191,11 @@ bool scsiRequestSense(int target_id, uint8_t *sense_key, uint8_t *sense_asc, uin
         dbgmsg("SASI RequestSense response: ", bytearray(sasi_response, 4),
                " error type ", (int)((error >> 4) & 3), " code ", (int)(error & 0xF));
 
-        // Map to the closest SCSI sense key for the callers
-        if (sense_key) *sense_key = (error == 0) ? NO_SENSE : MEDIUM_ERROR;
+        g_initiator_state.sasi_last_error = error;
+
+        // Map to the closest SCSI sense key for the callers.
+        // 0x18 = correctable data error: the controller has already corrected the data.
+        if (sense_key) *sense_key = (error == 0) ? NO_SENSE : (error == 0x18) ? RECOVERED_ERROR : MEDIUM_ERROR;
         if (sense_asc) *sense_asc = error;
         if (sense_ascq) *sense_ascq = 0;
         return sasi_status == 0;
@@ -1696,6 +1713,8 @@ bool scsiInitiatorReadDataToFile(int target_id, uint32_t start_sector, uint32_t 
     g_initiator_transfer.bytes_scsi_done = 0;
     g_initiator_transfer.all_ok = true;
 
+    uint32_t progress_time = millis();
+    uint32_t progress_bytes = 0;
     while (true)
     {
         platform_poll();
@@ -1704,6 +1723,24 @@ bool scsiInitiatorReadDataToFile(int target_id, uint32_t start_sector, uint32_t 
         if (phase != DATA_IN && phase != BUS_BUSY)
         {
             break;
+        }
+
+        // SASI: a target that aborts a transfer can leave the bus in a state that
+        // looks like BUS_BUSY. Do not wait for the watchdog if no data arrives.
+        if (g_initiator_state.sasi)
+        {
+            if (g_initiator_transfer.bytes_scsi_done != progress_bytes)
+            {
+                progress_bytes = g_initiator_transfer.bytes_scsi_done;
+                progress_time = millis();
+            }
+            else if ((uint32_t)(millis() - progress_time) > 1500)
+            {
+                logmsg("SASI: no data from target for 1.5 s in phase ", (int)phase, ", aborting transfer");
+                scsiHostPhyReset();
+                g_initiator_transfer.all_ok = false;
+                break;
+            }
         }
 
         // Read next block from SCSI bus if buffer empty
@@ -1793,7 +1830,15 @@ bool scsiInitiatorReadDataToFile(int target_id, uint32_t start_sector, uint32_t 
 
         if (sense_key == RECOVERED_ERROR)
         {
-            dbgmsg("scsiInitiatorReadDataToFile: RECOVERED_ERROR at ", (int)start_sector);
+            if (g_initiator_state.sasi)
+            {
+                logmsg("SASI: correctable data error (ECC) in ", (int)sectorcount, " sector(s) from ",
+                       (int)start_sector, ", data accepted");
+            }
+            else
+            {
+                dbgmsg("scsiInitiatorReadDataToFile: RECOVERED_ERROR at ", (int)start_sector);
+            }
             return true;
         }
         else if (sense_key == UNIT_ATTENTION)
