@@ -48,6 +48,9 @@ extern bool g_scsiHostSwapCdMsg;
 // Experiment: byte writes use a handshake with timeouts and bus state logging
 extern bool g_scsiHostDiag;
 
+// SASI: data phase reads tolerate pauses with REQ inactive (set from InitiatorSASI)
+extern bool g_scsiHostSasiTiming;
+
 // Diagnostic snapshot of bus lines. Returns bit mask: 1 BSY, 2 REQ, 4 C/D, 8 I/O, 16 MSG
 // (set = asserted). The data bus (set = asserted) is stored to *data if not NULL.
 uint32_t scsiHostPhyGetRawState(uint32_t *data);

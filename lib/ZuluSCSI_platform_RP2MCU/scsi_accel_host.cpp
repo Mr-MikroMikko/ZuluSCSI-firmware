@@ -36,6 +36,9 @@
 #define SCSI_PIO pio0
 #define SCSI_SM 0
 
+// Defined in scsiHostPhy.cpp, set for SASI targets (InitiatorSASI=1)
+extern bool g_scsiHostSasiTiming;
+
 static struct {
     // PIO configurations
     uint32_t pio_offset_async_read;
@@ -160,10 +163,19 @@ uint32_t scsi_accel_host_read(uint8_t *buf, uint32_t count, int *parityError, in
                 dbgmsg("scsi_accel_host_read: Aborting due to reset request");
                 abort = true;
             }
-            else if ((millis() - prev_rx_time) > 10000)
+            else if ((millis() - prev_rx_time) > (g_scsiHostSasiTiming ? 8000u : 10000u))
             {
+                // SASI: below the 15 s watchdog bus reset, above the controller's pauses
+                // (seek to an alternate track and back, re-reads on soft errors).
                 dbgmsg("scsi_accel_host_read: Aborting due to timeout");
                 abort = true;
+            }
+            else if (g_scsiHostSasiTiming)
+            {
+                // SASI (Xebec S1410A): the controller pauses inside the data phase while it
+                // seeks to an alternate track or re-reads a sector, and the phase lines must
+                // not be trusted while REQ is inactive. The PIO only transfers bytes on REQ,
+                // so just keep waiting; the timeout above ends a real stall.
             }
             else
             {

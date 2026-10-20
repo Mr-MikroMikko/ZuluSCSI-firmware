@@ -154,6 +154,9 @@ bool g_scsiHostSwapCdMsg = false;
 // When true, byte writes use a handshake with timeouts and bus state logging (SASI debugging)
 bool g_scsiHostDiag = false;
 
+// When true, data phase reads tolerate pauses with REQ inactive (SASI controllers)
+bool g_scsiHostSasiTiming = false;
+
 // Read the current communication phase as signaled by the target
 int scsiHostPhyGetPhase()
 {

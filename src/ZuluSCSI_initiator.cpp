@@ -101,6 +101,9 @@ static struct {
     uint32_t sasi_precomp;
     uint32_t sasi_ecc_burst;
     uint8_t sasi_last_error;        // Error code (hex) from the last REQUEST SENSE
+    bool sasi_params_ok;            // Controller has our drive characteristics (lost on bus reset)
+    int sasi_recover_failures;      // Consecutive failed recovery attempts
+    uint32_t sasi_alt_skipped;      // Sectors skipped on alternate / bad-flagged tracks
 
     // Is imaging a drive in progress, or are we scanning?
     bool imaging;
@@ -175,6 +178,10 @@ void scsiInitiatorInit()
         g_initiator_state.sasi_precomp = ini_getl("SCSI", "InitiatorSASIPrecompCyl", 64, CONFIGFILE);
         g_initiator_state.sasi_ecc_burst = ini_getl("SCSI", "InitiatorSASIEccBurst", 11, CONFIGFILE);
         g_scsiHostDiag = true; // timeouts and bus state logging in byte writes
+        g_scsiHostSasiTiming = true; // controller pauses within data phase, see scsi_accel_host_read()
+        g_initiator_state.sasi_params_ok = false;
+        g_initiator_state.sasi_recover_failures = 0;
+        g_initiator_state.sasi_alt_skipped = 0;
         g_scsiHostSwapCdMsg = ini_getbool("SCSI", "InitiatorSASISwapCdMsg", false, CONFIGFILE);
         if (g_scsiHostSwapCdMsg)
         {
@@ -308,7 +315,9 @@ void scsiInitiatorMainLoop()
     }
     else
     {
-        if (!g_sdcard_present || ini_getbool("SCSI", "InitiatorMSC", false, CONFIGFILE))
+        // MikkoMuseo read-only build: USB MSC initiator mode would expose the source drive
+        // to the PC. Never enter it automatically just because the SD card is missing.
+        if (g_sdcard_present && ini_getbool("SCSI", "InitiatorMSC", false, CONFIGFILE))
         {
             // This delay allows the USB serial console to connect immediately to the host
             // It also decreases the delay in callback processing of MSC commands
@@ -727,6 +736,12 @@ void scsiInitiatorMainLoop()
                 logmsg("NOTE: There were ",  (int) g_initiator_state.bad_sector_count, " bad sectors that could not be read off this drive.");
             }
 
+            if (g_initiator_state.sasi && g_initiator_state.sasi_alt_skipped != 0)
+            {
+                logmsg("NOTE: ", (int)g_initiator_state.sasi_alt_skipped,
+                       " sectors on alternate or bad-flagged tracks were skipped (left as zeros in the image).");
+            }
+
             if (!g_initiator_state.eject_when_done)
             {
                 // GT TODO
@@ -770,6 +785,33 @@ void scsiInitiatorMainLoop()
         if (g_initiator_state.sectors_done < g_initiator_state.failposition)
             numtoread = 1;
 
+        if (g_initiator_state.sasi)
+        {
+            // A bus reset makes the controller forget the drive characteristics (0x0C) and
+            // fall back to its default geometry, which silently reads wrong sectors.
+            // Never read before the parameters have been sent again successfully.
+            if (!g_initiator_state.sasi_params_ok)
+            {
+                if (!scsiSasiRecover(g_initiator_state.target_id))
+                {
+                    g_initiator_state.sasi_recover_failures++;
+                    if (g_initiator_state.sasi_recover_failures >= 10)
+                    {
+                        logmsg("SASI: controller did not accept drive characteristics after ",
+                               g_initiator_state.sasi_recover_failures, " attempts, imaging stopped at sector ",
+                               (int)g_initiator_state.sectors_done, " to avoid reading with wrong geometry");
+                        g_initiator_state.imaging = false;
+                        g_initiator_state.target_file.close();
+                        return;
+                    }
+                    delay_with_poll(1000);
+                    return;
+                }
+                g_initiator_state.sasi_recover_failures = 0;
+            }
+            g_initiator_state.sasi_last_error = 0;
+        }
+
         uint32_t time_start = millis();
         bool status = scsiInitiatorReadDataToFile(g_initiator_state.target_id,
             g_initiator_state.sectors_done, numtoread, g_initiator_state.sectorsize,
@@ -779,7 +821,39 @@ void scsiInitiatorMainLoop()
         {
             logmsg("Failed to transfer ", numtoread, " sectors starting at ", (int)g_initiator_state.sectors_done);
 
-            UIInitiatorFailedToTransfer(g_initiator_state.target_id);          
+            UIInitiatorFailedToTransfer(g_initiator_state.target_id);
+
+            if (g_initiator_state.sasi)
+            {
+                uint8_t e = g_initiator_state.sasi_last_error;
+                if (e == 0x1C || e == 0x19)
+                {
+                    // 0x1C: direct access to an alternate track is refused by the controller
+                    // (S1410A), its data is read through the bad track it replaces.
+                    // 0x19: track flagged bad. Retrying cannot help, skip the track.
+                    g_initiator_state.retrycount = 0;
+                    if (numtoread > 1)
+                    {
+                        logmsg("SASI: alternate or bad track inside batch, continuing sector-by-sector");
+                        g_initiator_state.failposition = g_initiator_state.sectors_done + numtoread;
+                    }
+                    else
+                    {
+                        uint32_t spt = g_initiator_state.sasi_sectors_per_track;
+                        uint32_t next = (g_initiator_state.sectors_done / spt + 1) * spt;
+                        if (next > g_initiator_state.sectorcount) next = g_initiator_state.sectorcount;
+                        logmsg("SASI: ", (e == 0x1C) ? "alternate track (direct access refused)" : "bad track flag",
+                               ", skipping sectors ", (int)g_initiator_state.sectors_done, "-", (int)(next - 1));
+                        g_initiator_state.sasi_alt_skipped += next - g_initiator_state.sectors_done;
+                        g_initiator_state.sectors_done = next;
+                    }
+                    g_initiator_state.target_file.seek((uint64_t)g_initiator_state.sectors_done * g_initiator_state.sectorsize);
+                    return;
+                }
+
+                // Any other failure may have involved a bus reset: re-send parameters before next read
+                g_initiator_state.sasi_params_ok = false;
+            }
 
             // SASI: when a single sector fails with a media error (ID field read error,
             // uncorrectable data, address mark / sector not found, bad track) retrying
@@ -801,11 +875,6 @@ void scsiInitiatorMainLoop()
                 // This reset causes some drives to hang and seems to have no effect if left off.
                 // scsiHostPhyReset();
                 delay_with_poll(200);
-
-                if (g_initiator_state.sasi)
-                {
-                    scsiSasiRecover(g_initiator_state.target_id);
-                }
 
                 g_initiator_state.retrycount++;
                 g_initiator_state.target_file.seek((uint64_t)g_initiator_state.sectors_done * g_initiator_state.sectorsize);
@@ -873,6 +942,29 @@ int scsiInitiatorRunCommand(int target_id,
                             const uint8_t *bufOut, size_t bufOutLen,
                             bool returnDataPhase, uint32_t timeout)
 {
+    // MikkoMuseo read-only build: the initiator must never change the source drive.
+    // Only commands that do not write to the medium are allowed; everything else
+    // (WRITE, FORMAT, FORMAT TRACK/BAD TRACK/ALTERNATE, WRITE BUFFER, MODE SELECT ...)
+    // is refused here, which also covers the USB MSC initiator mode.
+    // 0x0C (SASI Initialize Drive Characteristics) only sets controller RAM parameters.
+    switch (command[0])
+    {
+        case 0x00: // TEST UNIT READY / TEST DRIVE READY
+        case 0x01: // REZERO UNIT / RECALIBRATE
+        case 0x03: // REQUEST SENSE
+        case 0x08: // READ(6)
+        case 0x0C: // SASI: INITIALIZE DRIVE CHARACTERISTICS
+        case 0x12: // INQUIRY
+        case 0x1A: // MODE SENSE(6)
+        case 0x1B: // START STOP UNIT
+        case 0x25: // READ CAPACITY
+        case 0x28: // READ(10)
+            break;
+        default:
+            logmsg("READ-ONLY BUILD: refusing command 0x", bytearray(command, 1), " to target ", target_id);
+            return -1;
+    }
+
     // SCSI-3 targets take the LUN from the IDENTIFY message and reject
     // anything selected without one (ILLEGAL REQUEST / LUN NOT SUPPORTED).
     // The target only offers MESSAGE_OUT if we select with ATN asserted.
@@ -1220,41 +1312,19 @@ bool scsiRequestSense(int target_id, uint8_t *sense_key, uint8_t *sense_asc, uin
     return status == 0;
 }
 
-// SASI error recovery after a failed transfer: RECALIBRATE the drive to track 0
-// and send the drive characteristics again, so a "no seek complete" state
-// caused by an earlier aborted command does not persist.
+// SASI error recovery after a failed transfer: the same bring-up as at start
+// (TEST DRIVE READY until ready, drive characteristics 0x0C, RECALIBRATE).
+// Reading is allowed again only when all of them succeed.
 bool scsiSasiRecover(int target_id)
 {
-    uint8_t recal[6] = {0x01, 0, 0, 0, 0, 0};
-    int status = scsiInitiatorRunCommand(target_id, recal, sizeof(recal), NULL, 0, NULL, 0, false, 60000);
-    if (status != 0)
+    g_initiator_state.sasi_params_ok = false;
+    if (!scsiSasiProbe(target_id))
     {
-        uint8_t sense_key;
-        uint8_t error;
-        scsiRequestSense(target_id, &sense_key, &error);
-        logmsg("SASI recovery: Recalibrate failed, status ", status, " error ", (int)error);
+        logmsg("SASI recovery: drive bring-up failed, not reading yet");
         return false;
     }
 
-    if (g_initiator_state.sasi_send_params)
-    {
-        uint8_t cmd[6] = {0x0C, 0, 0, 0, 0, 0};
-        uint8_t params[8] = {
-            (uint8_t)(g_initiator_state.sasi_cylinders >> 8), (uint8_t)g_initiator_state.sasi_cylinders,
-            (uint8_t)g_initiator_state.sasi_heads,
-            (uint8_t)(g_initiator_state.sasi_reduced_write >> 8), (uint8_t)g_initiator_state.sasi_reduced_write,
-            (uint8_t)(g_initiator_state.sasi_precomp >> 8), (uint8_t)g_initiator_state.sasi_precomp,
-            (uint8_t)g_initiator_state.sasi_ecc_burst
-        };
-        status = scsiInitiatorRunCommand(target_id, cmd, sizeof(cmd), NULL, 0, params, sizeof(params));
-        if (status != 0)
-        {
-            logmsg("SASI recovery: Initialize Drive Characteristics failed, status ", status);
-            return false;
-        }
-    }
-
-    logmsg("SASI recovery: recalibrated drive");
+    logmsg("SASI recovery: drive characteristics sent and drive recalibrated");
     return true;
 }
 
@@ -1325,6 +1395,7 @@ bool scsiSasiProbe(int target_id)
         return false;
     }
 
+    g_initiator_state.sasi_params_ok = true;
     return true;
 }
 
@@ -1734,9 +1805,10 @@ bool scsiInitiatorReadDataToFile(int target_id, uint32_t start_sector, uint32_t 
                 progress_bytes = g_initiator_transfer.bytes_scsi_done;
                 progress_time = millis();
             }
-            else if ((uint32_t)(millis() - progress_time) > 1500)
+            else if ((uint32_t)(millis() - progress_time) > 10000)
             {
-                logmsg("SASI: no data from target for 1.5 s in phase ", (int)phase, ", aborting transfer");
+                // Backstop only: scsi_accel_host_read() itself gives up after 8 s in SASI mode.
+                logmsg("SASI: no data from target for 10 s in phase ", (int)phase, ", aborting transfer");
                 scsiHostPhyReset();
                 g_initiator_transfer.all_ok = false;
                 break;
