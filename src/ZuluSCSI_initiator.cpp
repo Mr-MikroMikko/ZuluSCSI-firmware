@@ -141,6 +141,51 @@ static struct {
 extern SdFs SD;
 static bool g_pause = false;
 
+// Position the image file at the given sector. SdFat cannot seek past the end of a
+// file on FAT32, so skipped sectors at the end of the file are filled with zeros
+// first; otherwise the following data would be written to the wrong offset.
+static bool initiatorSeekSector(uint32_t sector)
+{
+    FsFile &file = g_initiator_state.target_file;
+    uint64_t pos = (uint64_t)sector * g_initiator_state.sectorsize;
+    uint64_t size = file.fileSize();
+    if (pos > size)
+    {
+        static const uint8_t zeros[512] = {0};
+        if (!file.seek(size))
+        {
+            logmsg("Image file seek to end failed at ", (int)(size / g_initiator_state.sectorsize));
+            return false;
+        }
+        while (size < pos)
+        {
+            uint32_t n = (pos - size > sizeof(zeros)) ? sizeof(zeros) : (uint32_t)(pos - size);
+            if (file.write(zeros, n) != n)
+            {
+                logmsg("Image file write failed while filling skipped sectors");
+                return false;
+            }
+            size += n;
+        }
+    }
+
+    if (!file.seek(pos))
+    {
+        logmsg("Image file seek failed to sector ", (int)sector);
+        return false;
+    }
+    return true;
+}
+
+// Stop imaging instead of writing data to a wrong position in the image file
+static void initiatorStopImaging()
+{
+    logmsg("Imaging stopped at sector ", (int)g_initiator_state.sectors_done,
+           " because the image file could not be positioned; the image is incomplete");
+    g_initiator_state.imaging = false;
+    g_initiator_state.target_file.close();
+}
+
 // Initialization of initiator mode
 void scsiInitiatorInit()
 {
@@ -717,6 +762,13 @@ void scsiInitiatorMainLoop()
             {
                 scsiStartStopUnit(g_initiator_state.target_id, false);
             }
+            // Sectors skipped at the very end are not written yet: pad the image to full size
+            if (!initiatorSeekSector(g_initiator_state.sectorcount))
+            {
+                logmsg("WARNING: could not pad the image to its full size");
+            }
+            g_initiator_state.target_file.flush();
+
             logmsg("Finished imaging drive with id ", g_initiator_state.target_id);
             LED_OFF();
 
@@ -847,7 +899,7 @@ void scsiInitiatorMainLoop()
                         g_initiator_state.sasi_alt_skipped += next - g_initiator_state.sectors_done;
                         g_initiator_state.sectors_done = next;
                     }
-                    g_initiator_state.target_file.seek((uint64_t)g_initiator_state.sectors_done * g_initiator_state.sectorsize);
+                    if (!initiatorSeekSector(g_initiator_state.sectors_done)) { initiatorStopImaging(); return; }
                     return;
                 }
 
@@ -877,7 +929,7 @@ void scsiInitiatorMainLoop()
                 delay_with_poll(200);
 
                 g_initiator_state.retrycount++;
-                g_initiator_state.target_file.seek((uint64_t)g_initiator_state.sectors_done * g_initiator_state.sectorsize);
+                if (!initiatorSeekSector(g_initiator_state.sectors_done)) { initiatorStopImaging(); return; }
 
                 if (g_initiator_state.retrycount > 1 && numtoread > 1)
                 {
@@ -894,7 +946,7 @@ void scsiInitiatorMainLoop()
                 g_initiator_state.retrycount = 0;
                 g_initiator_state.sectors_done++;
                 g_initiator_state.bad_sector_count++;
-                g_initiator_state.target_file.seek((uint64_t)g_initiator_state.sectors_done * g_initiator_state.sectorsize);
+                if (!initiatorSeekSector(g_initiator_state.sectors_done)) { initiatorStopImaging(); return; }
 
                 UIInitiatorSkippedSector(g_initiator_state.target_id);
             }
