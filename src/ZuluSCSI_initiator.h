@@ -79,6 +79,9 @@ bool scsiRequestSense(int target_id, uint8_t *sense_key, uint8_t *sense_asc = nu
 // SASI (Xebec S1410 / WD1002) drive bring-up, used when InitiatorSASI=1
 bool scsiSasiProbe(int target_id);
 
+// SASI error recovery: RECALIBRATE and re-send drive characteristics
+bool scsiSasiRecover(int target_id);
+
 // Execute UNIT START STOP command to load/unload media
 bool scsiStartStopUnit(int target_id, bool start);
 

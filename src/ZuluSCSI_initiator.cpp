@@ -788,6 +788,11 @@ void scsiInitiatorMainLoop()
                 // scsiHostPhyReset();
                 delay_with_poll(200);
 
+                if (g_initiator_state.sasi)
+                {
+                    scsiSasiRecover(g_initiator_state.target_id);
+                }
+
                 g_initiator_state.retrycount++;
                 g_initiator_state.target_file.seek((uint64_t)g_initiator_state.sectors_done * g_initiator_state.sectorsize);
 
@@ -1196,6 +1201,44 @@ bool scsiRequestSense(int target_id, uint8_t *sense_key, uint8_t *sense_asc, uin
     if (sense_ascq) *sense_ascq = response[13];
 
     return status == 0;
+}
+
+// SASI error recovery after a failed transfer: RECALIBRATE the drive to track 0
+// and send the drive characteristics again, so a "no seek complete" state
+// caused by an earlier aborted command does not persist.
+bool scsiSasiRecover(int target_id)
+{
+    uint8_t recal[6] = {0x01, 0, 0, 0, 0, 0};
+    int status = scsiInitiatorRunCommand(target_id, recal, sizeof(recal), NULL, 0, NULL, 0, false, 60000);
+    if (status != 0)
+    {
+        uint8_t sense_key;
+        uint8_t error;
+        scsiRequestSense(target_id, &sense_key, &error);
+        logmsg("SASI recovery: Recalibrate failed, status ", status, " error ", (int)error);
+        return false;
+    }
+
+    if (g_initiator_state.sasi_send_params)
+    {
+        uint8_t cmd[6] = {0x0C, 0, 0, 0, 0, 0};
+        uint8_t params[8] = {
+            (uint8_t)(g_initiator_state.sasi_cylinders >> 8), (uint8_t)g_initiator_state.sasi_cylinders,
+            (uint8_t)g_initiator_state.sasi_heads,
+            (uint8_t)(g_initiator_state.sasi_reduced_write >> 8), (uint8_t)g_initiator_state.sasi_reduced_write,
+            (uint8_t)(g_initiator_state.sasi_precomp >> 8), (uint8_t)g_initiator_state.sasi_precomp,
+            (uint8_t)g_initiator_state.sasi_ecc_burst
+        };
+        status = scsiInitiatorRunCommand(target_id, cmd, sizeof(cmd), NULL, 0, params, sizeof(params));
+        if (status != 0)
+        {
+            logmsg("SASI recovery: Initialize Drive Characteristics failed, status ", status);
+            return false;
+        }
+    }
+
+    logmsg("SASI recovery: recalibrated drive");
+    return true;
 }
 
 // SASI (Xebec S1410, WD1002) drive bring-up:
@@ -1690,9 +1733,22 @@ bool scsiInitiatorReadDataToFile(int target_id, uint32_t start_sector, uint32_t 
         g_initiator_transfer.all_ok = false;
     }
 
+    uint32_t status_wait_start = millis();
+    bool status_wait_timeout = false;
     while ((phase = (SCSI_PHASE)scsiHostPhyGetPhase()) != BUS_FREE)
     {
         platform_poll();
+
+        // SASI targets may leave the bus in an unexpected phase after an aborted
+        // data transfer: do not wait for the watchdog, reset the bus instead.
+        if (g_initiator_state.sasi && (uint32_t)(millis() - status_wait_start) > 2000)
+        {
+            logmsg("SASI: target stuck in phase ", (int)phase, " after data transfer, resetting bus");
+            scsiHostPhyReset();
+            g_initiator_transfer.all_ok = false;
+            status_wait_timeout = true;
+            break;
+        }
 
         if (phase == MESSAGE_IN)
         {
@@ -1716,6 +1772,11 @@ bool scsiInitiatorReadDataToFile(int target_id, uint32_t start_sector, uint32_t 
             status = tmp;
             dbgmsg("------ STATUS: ", tmp);
         }
+    }
+
+    if (status_wait_timeout)
+    {
+        return false;
     }
 
     scsiHostWaitBusFree();
