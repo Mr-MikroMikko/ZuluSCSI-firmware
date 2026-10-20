@@ -177,6 +177,31 @@ static bool initiatorSeekSector(uint32_t sector)
     return true;
 }
 
+// Write zeros over skipped sectors [from, to) and leave the file positioned at 'to'.
+// A failed multi-sector transfer may already have written stale buffer contents
+// there, so seeking past them is not enough.
+static bool initiatorZeroSectors(uint32_t from, uint32_t to)
+{
+    if (!initiatorSeekSector(from))
+    {
+        return false;
+    }
+
+    static const uint8_t zeros[512] = {0};
+    uint64_t remaining = (uint64_t)(to - from) * g_initiator_state.sectorsize;
+    while (remaining > 0)
+    {
+        uint32_t n = (remaining > sizeof(zeros)) ? sizeof(zeros) : (uint32_t)remaining;
+        if (g_initiator_state.target_file.write(zeros, n) != n)
+        {
+            logmsg("Image file write failed while zeroing skipped sectors");
+            return false;
+        }
+        remaining -= n;
+    }
+    return true;
+}
+
 // Stop imaging instead of writing data to a wrong position in the image file
 static void initiatorStopImaging()
 {
@@ -897,6 +922,7 @@ void scsiInitiatorMainLoop()
                         logmsg("SASI: ", (e == 0x1C) ? "alternate track (direct access refused)" : "bad track flag",
                                ", skipping sectors ", (int)g_initiator_state.sectors_done, "-", (int)(next - 1));
                         g_initiator_state.sasi_alt_skipped += next - g_initiator_state.sectors_done;
+                        if (!initiatorZeroSectors(g_initiator_state.sectors_done, next)) { initiatorStopImaging(); return; }
                         g_initiator_state.sectors_done = next;
                     }
                     if (!initiatorSeekSector(g_initiator_state.sectors_done)) { initiatorStopImaging(); return; }
@@ -944,9 +970,10 @@ void scsiInitiatorMainLoop()
             {
                 logmsg("Retry limit exceeded, skipping one sector");
                 g_initiator_state.retrycount = 0;
+                // Zero the skipped sector: a failed transfer may have left stale data there
+                if (!initiatorZeroSectors(g_initiator_state.sectors_done, g_initiator_state.sectors_done + 1)) { initiatorStopImaging(); return; }
                 g_initiator_state.sectors_done++;
                 g_initiator_state.bad_sector_count++;
-                if (!initiatorSeekSector(g_initiator_state.sectors_done)) { initiatorStopImaging(); return; }
 
                 UIInitiatorSkippedSector(g_initiator_state.target_id);
             }
