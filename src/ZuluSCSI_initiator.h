@@ -82,6 +82,9 @@ bool scsiSasiProbe(int target_id);
 // SASI error recovery: RECALIBRATE and re-send drive characteristics
 bool scsiSasiRecover(int target_id);
 
+// True only when InitiatorAllowWrite = 1: commands that write to the source drive are allowed
+bool scsiInitiatorWriteAllowed();
+
 // Execute UNIT START STOP command to load/unload media
 bool scsiStartStopUnit(int target_id, bool start);
 

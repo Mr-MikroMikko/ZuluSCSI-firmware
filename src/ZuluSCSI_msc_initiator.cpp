@@ -162,8 +162,9 @@ bool setup_msc_initiator()
     }
 
     g_msc_initiator_state.status_interval = ini_getl("SCSI", "InitiatorMSCStatusInterval", 5000, CONFIGFILE);
-    // MikkoMuseo read-only build: always read-only regardless of InitiatorMSCReadOnly
-    g_msc_initiator_state.readonly = true;
+    // Read-only unless InitiatorAllowWrite = 1 (and InitiatorMSCReadOnly is not set)
+    g_msc_initiator_state.readonly = !scsiInitiatorWriteAllowed()
+        || ini_getbool("SCSI", "InitiatorMSCReadOnly", false, CONFIGFILE);
 
     if (g_msc_initiator_state.readonly)
     {

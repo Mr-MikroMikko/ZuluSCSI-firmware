@@ -141,6 +141,15 @@ static struct {
 extern SdFs SD;
 static bool g_pause = false;
 
+// The initiator never changes the source drive unless InitiatorAllowWrite = 1 is set.
+// Without an SD card or .ini file this stays false.
+static bool g_initiator_allow_write = false;
+
+bool scsiInitiatorWriteAllowed()
+{
+    return g_initiator_allow_write;
+}
+
 // Position the image file at the given sector. SdFat cannot seek past the end of a
 // file on FAT32, so skipped sectors at the end of the file are filled with zeros
 // first; otherwise the following data would be written to the wrong offset.
@@ -226,6 +235,19 @@ void scsiInitiatorInit()
     {
         logmsg("InitiatorID set to ID ", g_initiator_state.initiator_id);
     }
+    g_initiator_allow_write = ini_getbool("SCSI", "InitiatorAllowWrite", false, CONFIGFILE);
+    if (g_initiator_allow_write)
+    {
+        logmsg("*************************************************************************");
+        logmsg("  WARNING: InitiatorAllowWrite = 1, commands that WRITE to the source");
+        logmsg("  drive are allowed (USB MSC writes, format commands)");
+        logmsg("*************************************************************************");
+    }
+    else
+    {
+        logmsg("Initiator is read-only: write commands to the source drive are refused (InitiatorAllowWrite = 0)");
+    }
+
     g_initiator_state.max_retry_count = ini_getl("SCSI", "InitiatorMaxRetry", 5, CONFIGFILE);
     g_initiator_state.use_read10 = ini_getbool("SCSI", "InitiatorUseRead10", false, CONFIGFILE);
     g_initiator_state.use_identify = ini_getbool("SCSI", "InitiatorIdentify", true, CONFIGFILE);
@@ -385,9 +407,9 @@ void scsiInitiatorMainLoop()
     }
     else
     {
-        // MikkoMuseo read-only build: USB MSC initiator mode would expose the source drive
-        // to the PC. Never enter it automatically just because the SD card is missing.
-        if (g_sdcard_present && ini_getbool("SCSI", "InitiatorMSC", false, CONFIGFILE))
+        // Upstream behaviour: USB MSC initiator mode without SD card or with InitiatorMSC = 1.
+        // Without an SD card there is no .ini, so InitiatorAllowWrite stays 0 and MSC is read-only.
+        if (!g_sdcard_present || ini_getbool("SCSI", "InitiatorMSC", false, CONFIGFILE))
         {
             // This delay allows the USB serial console to connect immediately to the host
             // It also decreases the delay in callback processing of MSC commands
@@ -1021,27 +1043,31 @@ int scsiInitiatorRunCommand(int target_id,
                             const uint8_t *bufOut, size_t bufOutLen,
                             bool returnDataPhase, uint32_t timeout)
 {
-    // MikkoMuseo read-only build: the initiator must never change the source drive.
+    // Unless InitiatorAllowWrite = 1, the initiator must never change the source drive.
     // Only commands that do not write to the medium are allowed; everything else
     // (WRITE, FORMAT, FORMAT TRACK/BAD TRACK/ALTERNATE, WRITE BUFFER, MODE SELECT ...)
     // is refused here, which also covers the USB MSC initiator mode.
     // 0x0C (SASI Initialize Drive Characteristics) only sets controller RAM parameters.
-    switch (command[0])
+    if (!g_initiator_allow_write)
     {
-        case 0x00: // TEST UNIT READY / TEST DRIVE READY
-        case 0x01: // REZERO UNIT / RECALIBRATE
-        case 0x03: // REQUEST SENSE
-        case 0x08: // READ(6)
-        case 0x0C: // SASI: INITIALIZE DRIVE CHARACTERISTICS
-        case 0x12: // INQUIRY
-        case 0x1A: // MODE SENSE(6)
-        case 0x1B: // START STOP UNIT
-        case 0x25: // READ CAPACITY
-        case 0x28: // READ(10)
-            break;
-        default:
-            logmsg("READ-ONLY BUILD: refusing command 0x", bytearray(command, 1), " to target ", target_id);
-            return -1;
+        switch (command[0])
+        {
+            case 0x00: // TEST UNIT READY / TEST DRIVE READY
+            case 0x01: // REZERO UNIT / RECALIBRATE
+            case 0x03: // REQUEST SENSE
+            case 0x08: // READ(6)
+            case 0x0C: // SASI: INITIALIZE DRIVE CHARACTERISTICS
+            case 0x12: // INQUIRY
+            case 0x1A: // MODE SENSE(6)
+            case 0x1B: // START STOP UNIT
+            case 0x25: // READ CAPACITY
+            case 0x28: // READ(10)
+                break;
+            default:
+                logmsg("READ-ONLY: refusing command 0x", bytearray(command, 1), " to target ", target_id,
+                       " (set InitiatorAllowWrite = 1 to allow writes)");
+                return -1;
+        }
     }
 
     // SCSI-3 targets take the LUN from the IDENTIFY message and reject
