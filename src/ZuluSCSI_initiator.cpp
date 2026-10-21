@@ -104,6 +104,8 @@ static struct {
     bool sasi_params_ok;            // Controller has our drive characteristics (lost on bus reset)
     int sasi_recover_failures;      // Consecutive failed recovery attempts
     uint32_t sasi_alt_skipped;      // Sectors skipped on alternate / bad-flagged tracks
+    bool sasi_skip_track_on_seek_error; // InitiatorSASISkipTrackOnSeekError: 0x15 skips the track
+    uint32_t sasi_seek_skipped;     // Sectors skipped on tracks with seek error / ID not found
 
     // Is imaging a drive in progress, or are we scanning?
     bool imaging;
@@ -274,6 +276,13 @@ void scsiInitiatorInit()
         g_initiator_state.sasi_params_ok = false;
         g_initiator_state.sasi_recover_failures = 0;
         g_initiator_state.sasi_alt_skipped = 0;
+        g_initiator_state.sasi_seek_skipped = 0;
+        // Off by default: on a normal drive a single seek error must not skip a whole track
+        g_initiator_state.sasi_skip_track_on_seek_error = ini_getbool("SCSI", "InitiatorSASISkipTrackOnSeekError", false, CONFIGFILE);
+        if (g_initiator_state.sasi_skip_track_on_seek_error)
+        {
+            logmsg("SASI initiator: seek error / ID not found (0x15) skips the whole track (InitiatorSASISkipTrackOnSeekError = 1)");
+        }
         g_scsiHostSwapCdMsg = ini_getbool("SCSI", "InitiatorSASISwapCdMsg", false, CONFIGFILE);
         if (g_scsiHostSwapCdMsg)
         {
@@ -841,6 +850,12 @@ void scsiInitiatorMainLoop()
                        " sectors on alternate or bad-flagged tracks were skipped (left as zeros in the image).");
             }
 
+            if (g_initiator_state.sasi && g_initiator_state.sasi_seek_skipped != 0)
+            {
+                logmsg("NOTE: ", (int)g_initiator_state.sasi_seek_skipped,
+                       " sectors on tracks with seek error / ID not found were skipped (left as zeros in the image).");
+            }
+
             if (!g_initiator_state.eject_when_done)
             {
                 // GT TODO
@@ -925,7 +940,14 @@ void scsiInitiatorMainLoop()
             if (g_initiator_state.sasi)
             {
                 uint8_t e = g_initiator_state.sasi_last_error;
-                if (e == 0x1C || e == 0x19)
+                bool seek_skip = (e == 0x15 && g_initiator_state.sasi_skip_track_on_seek_error);
+                if (seek_skip)
+                {
+                    // WD1010-based controllers report "ID not found" (e.g. an unformatted
+                    // track) as seek error 0x15. Recalibrate before the next read.
+                    g_initiator_state.sasi_params_ok = false;
+                }
+                if (e == 0x1C || e == 0x19 || seek_skip)
                 {
                     // 0x1C: direct access to an alternate track is refused by the controller
                     // (S1410A), its data is read through the bad track it replaces.
@@ -941,9 +963,16 @@ void scsiInitiatorMainLoop()
                         uint32_t spt = g_initiator_state.sasi_sectors_per_track;
                         uint32_t next = (g_initiator_state.sectors_done / spt + 1) * spt;
                         if (next > g_initiator_state.sectorcount) next = g_initiator_state.sectorcount;
-                        logmsg("SASI: ", (e == 0x1C) ? "alternate track (direct access refused)" : "bad track flag",
-                               ", skipping sectors ", (int)g_initiator_state.sectors_done, "-", (int)(next - 1));
-                        g_initiator_state.sasi_alt_skipped += next - g_initiator_state.sectors_done;
+                        uint32_t track = g_initiator_state.sectors_done / spt;
+                        logmsg("SASI: ", (e == 0x1C) ? "alternate track (direct access refused)" :
+                                         (e == 0x19) ? "bad track flag" : "seek error / ID not found (0x15)",
+                               ", skipping sectors ", (int)g_initiator_state.sectors_done, "-", (int)(next - 1),
+                               " (cylinder ", (int)(track / g_initiator_state.sasi_heads),
+                               " head ", (int)(track % g_initiator_state.sasi_heads), ")");
+                        if (seek_skip)
+                            g_initiator_state.sasi_seek_skipped += next - g_initiator_state.sectors_done;
+                        else
+                            g_initiator_state.sasi_alt_skipped += next - g_initiator_state.sectors_done;
                         if (!initiatorZeroSectors(g_initiator_state.sectors_done, next)) { initiatorStopImaging(); return; }
                         g_initiator_state.sectors_done = next;
                     }
