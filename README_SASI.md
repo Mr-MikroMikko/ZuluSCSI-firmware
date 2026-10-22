@@ -1,8 +1,8 @@
 # SASI initiator support (branch `sasi-initiator`)
 
 This branch of the ZuluSCSI firmware adds **SASI initiator mode**: imaging hard disks
-behind early SASI controllers such as the **Xebec S1410 / S1410A** (ST-506/ST-412 MFM
-drives) to an image file on the SD card.
+behind early SASI controllers such as the **Xebec S1410 / S1410A** and the
+**Western Digital WD1002-SHD** (ST-506/ST-412 MFM drives) to an image file on the SD card.
 
 It is maintained by Mr. MikroMikko for the preservation of Nokia MikroMikko computers.
 It is not an official ZuluSCSI release and is not affiliated with Rabbit Hole Computing.
@@ -19,6 +19,7 @@ mode (DIP switches: Initiator on, termination on):
 |---|---|---|---|---|
 | Nokia MikroMikko 1 M7 | Xebec (S1410A compatible) | Seagate ST-406 | 306 × 2 × 32 × 256 | complete, ~5 min, 4 identical reads |
 | Nokia MikroMikko 2 | Xebec | Seagate ST-406 | 306 × 2 × 17 × 512 | complete, ~76 s, identical to an independent raw MFM capture |
+| Nokia MikroMikko 2A | Western Digital WD1002-SHD (WD1010) | NEC D5126 | 615 × 4 × 17 × 512 | complete, 2 reads identical; cylinders 612–614 unformatted (skipped, zeros) |
 
 The ZuluSCSI Compact RP2040 Rev 2022a could not be used as an initiator (hardware level).
 
@@ -38,6 +39,21 @@ InitiatorSASIPrecompCyl = 128
 InitiatorSASIEccBurst = 11
 InitiatorSASISelectInitiatorBit = 0
 InitiatorAllowWrite = 0            ; default: never write to the source drive
+InitiatorSASISkipTrackOnSeekError = 0 ; 1: seek error 0x15 skips the whole track (WD1002)
+```
+
+**Western Digital WD1002-SHD** (WD1010 based; OEM manual 79-000004): the same 8-byte
+parameter block is sent with command 0x0C (SET PARAMETERS). Without it the controller
+uses its reset default of 153 cylinders / 4 heads. Settings used for the NEC D5126:
+
+```ini
+InitiatorSASICylinders = 615
+InitiatorSASIHeads = 4
+InitiatorSASISectorsPerTrack = 17
+InitiatorSASIBlockSize = 512
+InitiatorSASIPrecompCyl = 64
+InitiatorSASIEccBurst = 5          ; ECC burst length recommended by the WD manual
+InitiatorSASISkipTrackOnSeekError = 1
 ```
 
 ## What the SASI mode does
@@ -55,6 +71,10 @@ InitiatorAllowWrite = 0            ; default: never write to the source drive
 - **Alternate tracks (S1410A):** error 0x1C (direct access to an alternate track) and
   0x19 (bad track flag) skip the whole track without retries; the image keeps zeros there.
   The data of a bad track is read through the controller at its logical position.
+- **Seek error / ID not found (0x15), optional:** with `InitiatorSASISkipTrackOnSeekError = 1`
+  the whole track is skipped (zeros) instead of retrying every sector. On WD1010-based
+  controllers 0x15 means that no sector ID was found, e.g. on cylinders that were never
+  formatted (the NEC D5126 above was formatted to 612 of its 615 cylinders).
 - **Correctable ECC errors (0x18)** are accepted, the controller has corrected the data.
 - **Image file fixes (all modes):** skipped sectors are written as zeros (SdFat cannot seek
   past the end of a file on FAT32, and a failed transfer may leave stale buffer data);
